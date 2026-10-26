@@ -1,0 +1,150 @@
+substitutions:
+  wifi_tx_power: "12"
+  # Effective offset calibrated from 0.978236 m air gap + 6.25 in oil.
+  sensor_to_bottom_in: "44.76323"
+  tank_height_in: "44.0"
+  tank_width_in: "26.75"
+  tank_capacity_gal: "275.0"
+  tank_count: "2"
+
+# Bench-test configuration. Oil-vapor suitability is not established.
+# Add wifi_ssid and wifi_password to your ESPHome secrets.yaml.
+esphome:
+  name: oil-tank
+  friendly_name: Heating Oil Tanks
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret oil_tank__encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret oil_tank__ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: ${wifi_tx_power}dB
+sensor:
+  - platform: wifi_signal
+    name: WiFi Signal Strength
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: template
+    name: WiFi Configured TX Power
+    unit_of_measurement: dBm
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return ${wifi_tx_power};
+
+  - platform: ultrasonic
+    trigger_pin: GPIO4
+    echo_pin: GPIO3
+    id: oil_air_gap
+    name: Oil Surface Distance
+    pulse_time: 15us
+    timeout: 2m
+    update_interval: 10s
+    unit_of_measurement: m
+    accuracy_decimals: 3
+    filters:
+      # Ignore failed echoes; mark unavailable after 60s without a valid echo.
+      - filter_out: nan
+      - median:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+      # Median collects every valid sample; suppress its first four outputs.
+      - lambda: |-
+          static uint8_t samples = 0;
+          if (samples < 5) samples++;
+          if (samples < 5) return {};
+          return x;
+      # Smooth small fluctuations; approximately 4 minutes to follow
+      # 95% of a sustained level change at the 10-second sample interval.
+      - exponential_moving_average:
+          alpha: 0.12
+          send_every: 1
+      - timeout: 60s
+    on_value:
+      then:
+        - component.update: oil_depth_in
+        - component.update: oil_gallons_per_tank
+        - component.update: oil_total_gallons
+        - component.update: oil_remaining_pct
+
+  - platform: template
+    name: Oil Depth
+    id: oil_depth_in
+    unit_of_measurement: in
+    accuracy_decimals: 2
+    state_class: measurement
+    update_interval: never
+    lambda: |-
+      const float d = id(oil_air_gap).state;
+      if (!std::isfinite(d)) return NAN;
+      const float h = ${sensor_to_bottom_in}f - d * 39.37007874f;
+      return fminf(${tank_height_in}f, fmaxf(0.0f, h));
+
+  - platform: template
+    name: Estimated Gallons Per Tank
+    id: oil_gallons_per_tank
+    unit_of_measurement: gal
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: never
+    # Approximate vertical oval: semicircular ends joined by straight sides.
+    # Outside dimensions determine shape; nominal capacity sets volume.
+    # Constant length cancels in area fraction, so 58.5 in is not needed here.
+    lambda: |-
+      const double h = id(oil_depth_in).state;
+      if (!std::isfinite(h)) return NAN;
+      const double H = ${tank_height_in};
+      const double r = ${tank_width_in} / 2.0;
+      const double straight = H - 2.0 * r;
+      const double pi = 3.141592653589793;
+      const double total = pi * r * r + 2.0 * r * straight;
+      auto segment = [r](double depth) -> double {
+        const double y = r - depth;
+        return r * r * acos(y / r)
+          - y * sqrt(fmax(0.0, r * r - y * y));
+      };
+      double area;
+      if (h <= r) area = segment(h);
+      else if (h <= H - r)
+        area = pi * r * r / 2.0 + 2.0 * r * (h - r);
+      else area = total - segment(H - h);
+      return ${tank_capacity_gal} * area / total;
+
+  - platform: template
+    name: Estimated Total Oil Gallons
+    id: oil_total_gallons
+    unit_of_measurement: gal
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: never
+    lambda: |-
+      return id(oil_gallons_per_tank).state * ${tank_count};
+
+  - platform: template
+    name: Estimated Oil Remaining
+    id: oil_remaining_pct
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: never
+    lambda: |-
+      return id(oil_gallons_per_tank).state / ${tank_capacity_gal} * 100.0f;
+
+binary_sensor:
+  - platform: status
+    name: Monitor Online
